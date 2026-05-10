@@ -1,364 +1,250 @@
-"""
-학습된 DQN 모델로 CartPole 추론 및 시각화
-==========================================
-실행 전 train.py 학습으로 outputs/best_model.keras 가 생성되어 있어야 합니다.
-
-실시간 화면:
-  - pygame 창에 CartPole 제어 화면을 표시
-  - 상단 HUD: 스텝 / 보상 / 에피소드 / 행동 방향
-  - ESC 또는 창 닫기로 조기 종료 가능
-
-출력물:
-  outputs/inference_best.gif    - 최고 에피소드 애니메이션
-  outputs/inference_states.png  - 최고 에피소드 상태 변수 그래프
-  outputs/inference_summary.png - 전체 평가 에피소드 보상 요약
-"""
-
 import os
-os.environ["KERAS_BACKEND"] = "torch"  # must be set before importing keras
-
-import json
 import time
-from pathlib import Path
 import numpy as np
 import torch
-import keras
-import gymnasium as gym
+import mujoco
+import mujoco.viewer
 import matplotlib
-matplotlib.use('Agg')
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from PIL import Image
-import pygame
+import matplotlib.font_manager as fm
 
-# ─────────────────────────────────────────
-# 경로 / 상수
-# ─────────────────────────────────────────
-OUTPUT_DIR        = Path(__file__).resolve().parent / "outputs"
-BEST_MODEL_PATH   = OUTPUT_DIR / "best_model.keras"
-BEST_MODEL_METADATA_PATH = OUTPUT_DIR / "best_model_metadata.json"
-GIF_PATH          = OUTPUT_DIR / "inference_best.gif"
-STATES_PLOT_PATH  = OUTPUT_DIR / "inference_states.png"
-SUMMARY_PLOT_PATH = OUTPUT_DIR / "inference_summary.png"
+os.environ["KERAS_BACKEND"] = "torch"
+import keras
 
-DEVICE          = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-EVAL_EPISODES   = 5     # 평가할 에피소드 수
-GIF_DURATION_MS = 33    # GIF 프레임 간격 (ms) ≈ 30 fps
-DISPLAY_FPS     = 50    # 실시간 창 목표 FPS
-DISPLAY_SCALE   = 2     # 창 확대 배율 (600×400 → 1200×800)
-PAUSE_ON_END    = 0.8   # 에피소드 종료 후 대기 시간 (초)
+if any(font.name == "Malgun Gothic" for font in fm.fontManager.ttflist):
+    plt.rcParams["font.family"] = "Malgun Gothic"
+plt.rcParams["axes.unicode_minus"] = False
 
-if matplotlib.get_backend().lower() == "agg":
-    matplotlib.rcParams["font.family"] = ["Malgun Gothic", "DejaVu Sans"]
-    matplotlib.rcParams["axes.unicode_minus"] = False
+# ══════════════════════════════════ 설정 ══════════════════════════════════════
+N_EPISODES       = 5            # 실행할 에피소드 수
+MAX_STEPS        = 1000          # 에피소드 최대 스텝
+INIT_CART_RANGE  = 0.5          # 초기 카트 위치 범위 [-0.5, 0.5] m
+ANGLE_LIMIT_DEG  = 90         # 폴 각도 실패 한계 [-36, 36] deg
+ANGLE_LIMIT = np.deg2rad(ANGLE_LIMIT_DEG)
 
+INIT_ANGLE_DEG   = 30         # 초기 폴 각도 범위 [-17.2, 17.2] deg
+INIT_ANGLE_RAD = np.deg2rad(INIT_ANGLE_DEG)
 
-# ══════════════════════════════════════════
-# 1. 모델 로드
-# ══════════════════════════════════════════
-def model_device(model: torch.nn.Module) -> torch.device:
-    """Return the device of the first trainable parameter."""
-    return next(model.parameters()).device
+INIT_VEL_RANGE   = 0.05         # 초기 속도 범위 [-0.05, 0.05]
+EPISODE_PAUSE    = 1.0          # 에피소드 종료 후 대기 시간 (초)
+MODEL_ACTOR_PATH = "best_actor.weights.h5"
+PLOT_SAVE_PATH   = "inference_result.png"
 
+_DIR     = os.path.dirname(os.path.abspath(__file__))
+XML_PATH = os.path.join(_DIR, "cartpole.xml")
 
-def load_model(path: Path) -> tuple[keras.Model, dict]:
-    if not path.exists():
-        raise FileNotFoundError(
-            f"모델 파일이 없습니다: {path}\n"
-            "먼저 train.py를 실행해 학습을 완료하세요."
-        )
-    model = keras.saving.load_model(path).to(DEVICE)
-    model.eval()
+# train.py와 반드시 동일해야 함
+ACTION_SCALE = 10.0
+ACTION_DIM   = 1
+N_STATES     = 4    # [카트위치, 카트속도, 폴각도, 폴각속도]
 
-    metadata = {}
-    if BEST_MODEL_METADATA_PATH.exists():
-        metadata = json.loads(BEST_MODEL_METADATA_PATH.read_text(encoding="utf-8"))
-    return model, metadata
+DEVICE      = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+CART_LIMIT  = 2.4
+# ═════════════════════════════════════════════════════════════════════════════
 
 
-# ══════════════════════════════════════════
-# 2. HUD 렌더링 헬퍼
-# ══════════════════════════════════════════
-def _draw_hud(screen: pygame.Surface, font_lg: pygame.font.Font,
-              font_sm: pygame.font.Font, step: int, reward: float,
-              ep: int, total_eps: int, action: int, w: int) -> None:
-    """화면 상단에 반투명 HUD를 그린다."""
-    hud_h = 44
-    hud = pygame.Surface((w, hud_h), pygame.SRCALPHA)
-    hud.fill((0, 0, 0, 170))
-    screen.blit(hud, (0, 0))
-
-    left_txt  = font_lg.render(f"Step {step:>3}   Reward {reward:>5.0f}", True, (220, 220, 220))
-    right_txt = font_sm.render(
-        f"Episode {ep}/{total_eps}   Action: {'LEFT <-' if action == 0 else '-> RIGHT'}",
-        True, (160, 210, 255)
-    )
-    screen.blit(left_txt,  (12, 6))
-    screen.blit(right_txt, (12, 26))
+def build_actor() -> keras.Model:
+    # train.py의 SAC Actor 구조와 동일해야 가중치를 올바르게 로드할 수 있음
+    return keras.Sequential([
+        keras.layers.Input(shape=(N_STATES,)),
+        keras.layers.Dense(256, activation="gelu"),
+        keras.layers.Dense(256, activation="gelu"),
+        keras.layers.Dense(ACTION_DIM * 2),   # 전반부: mean / 후반부: log_std
+    ])
 
 
-# ══════════════════════════════════════════
-# 3. 실시간 에피소드 실행
-#    - pygame 창에 실시간 표시
-#    - rgb_array 프레임 동시 캡처 (GIF용)
-# ══════════════════════════════════════════
-def run_episode(
-    env: gym.Env,
-    model: keras.Model,
-    screen: pygame.Surface,
-    font_lg: pygame.font.Font,
-    font_sm: pygame.font.Font,
-    clock: pygame.time.Clock,
-    seed: int = 0,
-    ep_num: int = 1,
-    total_eps: int = 1,
-) -> tuple[list[np.ndarray], np.ndarray, float, bool]:
-    """
-    반환값:
-      frames      - rgb_array 프레임 리스트 (GIF용)
-      states_arr  - (T, 4) 상태 배열
-      reward      - 총 보상 (유지 스텝 수)
-      aborted     - 사용자가 창을 닫았으면 True
-    """
-    state, _ = env.reset(seed=seed)
-
-    W, H    = screen.get_width(), screen.get_height()
-    env_w   = W // DISPLAY_SCALE
-    env_h   = H // DISPLAY_SCALE
-
-    frames: list[np.ndarray] = []
-    states: list[np.ndarray] = []
-    total_reward = 0.0
-    action       = 0
-    aborted      = False
-
-    for step in range(1000):
-        # ── pygame 이벤트 처리 ──────────────────
-        for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-                aborted = True
-            if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
-                aborted = True
-
-        frame = env.render()          # (H_env, W_env, 3) uint8
-        frames.append(frame.copy())
-        states.append(state.copy())
-
-        # numpy (H, W, C) → pygame surface → 확대
-        surf = pygame.image.frombuffer(frame.tobytes(), (env_w, env_h), "RGB")
-        surf_scaled = pygame.transform.scale(surf, (W, H))
-        screen.blit(surf_scaled, (0, 0))
-        _draw_hud(screen, font_lg, font_sm, step + 1, total_reward,
-                  ep_num, total_eps, action, W)
-        pygame.display.flip()
-        clock.tick(DISPLAY_FPS)
-
-        if aborted:
-            break
-
-        # ── 행동 선택 ───────────────────────────
-        with torch.no_grad():
-            state_t = torch.as_tensor(state, dtype=torch.float32, device=DEVICE).unsqueeze(0)
-            action  = int(model(state_t).argmax().item())
-
-        state, reward, terminated, truncated, _ = env.step(action)
-        total_reward += reward
-
-        if terminated or truncated:
-            # 마지막 프레임 캡처
-            frame = env.render()
-            frames.append(frame.copy())
-            states.append(state.copy())
-            # 종료 상태 잠깐 표시
-            surf = pygame.image.frombuffer(frame.tobytes(), (env_w, env_h), "RGB")
-            screen.blit(pygame.transform.scale(surf, (W, H)), (0, 0))
-            _draw_hud(screen, font_lg, font_sm, step + 2, total_reward,
-                      ep_num, total_eps, action, W)
-            pygame.display.flip()
-            time.sleep(PAUSE_ON_END)
-            break
-
-    return frames, np.array(states), total_reward, aborted
+def load_actor(path: str) -> keras.Model:
+    model = build_actor()
+    model(torch.zeros(1, N_STATES))   # 가중치 초기화
+    if DEVICE.type == "cuda":
+        model.cuda()
+    model.load_weights(path)
+    print(f"[모델 로드] {path}")
+    return model
 
 
-# ══════════════════════════════════════════
-# 4. GIF 저장
-# ══════════════════════════════════════════
-def save_gif(frames: list[np.ndarray], path: Path) -> None:
-    pil_frames = [Image.fromarray(f) for f in frames]
-    pil_frames[0].save(
-        path,
-        save_all=True,
-        append_images=pil_frames[1:],
-        duration=GIF_DURATION_MS,
-        loop=0,
-    )
-    print(f"  [저장] GIF  → {path}  ({len(frames)} 프레임)")
+def select_action(actor: keras.Model, state: np.ndarray) -> float:
+    """결정론적 행동 선택 — 분포의 평균(mean)에 tanh 적용."""
+    x = torch.from_numpy(state).unsqueeze(0).to(DEVICE)
+    with torch.no_grad():
+        out    = actor(x)                         # (1, ACTION_DIM * 2)
+        mean   = out[:, :ACTION_DIM]              # 전반부만 사용
+        action = torch.tanh(mean) * ACTION_SCALE
+    return float(action.squeeze())
 
 
-# ══════════════════════════════════════════
-# 5. 상태 변수 시각화 (최고 에피소드)
-# ══════════════════════════════════════════
-def plot_states(states: np.ndarray, reward: float, path: Path) -> None:
-    steps  = range(len(states))
-    labels = ["카트 위치 (m)", "카트 속도 (m/s)", "막대 각도 (rad)", "막대 각속도 (rad/s)"]
-    colors = ["#4ecdc4", "#ff6b6b", "#ffd93d", "#c3a6ff"]
-    limits = [2.4, None, 0.2095, None]
-
-    fig, axes = plt.subplots(2, 2, figsize=(13, 8))
-    fig.patch.set_facecolor("#0f0f0f")
-
-    for i, ax in enumerate(axes.flatten()):
-        ax.set_facecolor("#1a1a2e")
-        ax.tick_params(colors="#aaaaaa")
-        for spine in ("bottom", "left"):
-            ax.spines[spine].set_color("#333355")
-        ax.spines["top"].set_visible(False)
-        ax.spines["right"].set_visible(False)
-
-        ax.plot(steps, states[:, i], color=colors[i], linewidth=1.6)
-        ax.fill_between(steps, states[:, i], alpha=0.18, color=colors[i])
-        ax.axhline(0, color="#555566", linewidth=0.8, linestyle="--")
-
-        if limits[i] is not None:
-            ax.axhline( limits[i], color="#ff4444", linewidth=1.0,
-                        linestyle=":", label=f"한계 ±{limits[i]}")
-            ax.axhline(-limits[i], color="#ff4444", linewidth=1.0, linestyle=":")
-            ax.legend(facecolor="#1a1a2e", edgecolor="#333355",
-                      labelcolor="white", fontsize=9)
-
-        ax.set_xlabel("스텝", color="#aaaaaa", fontsize=10)
-        ax.set_ylabel(labels[i], color="#aaaaaa", fontsize=10)
-        ax.set_title(labels[i], color="white", fontsize=11, fontweight="bold")
-
-    fig.suptitle(
-        f"추론 상태 변화  |  총 {reward:.0f} 스텝 유지",
-        color="white", fontsize=14, fontweight="bold", y=1.01,
-    )
-    plt.tight_layout()
-    plt.savefig(path, dpi=150, bbox_inches="tight", facecolor="#0f0f0f")
-    print(f"  [저장] 상태 그래프 → {path}")
+def get_state(data) -> np.ndarray:
+    return data.sensordata.copy().astype(np.float32)
 
 
-# ══════════════════════════════════════════
-# 6. 전체 평가 요약 시각화
-# ══════════════════════════════════════════
-def plot_summary(rewards: list[float], best_ep: int, path: Path) -> None:
-    fig, ax = plt.subplots(figsize=(10, 4))
-    fig.patch.set_facecolor("#0f0f0f")
-    ax.set_facecolor("#1a1a2e")
-    ax.tick_params(colors="#aaaaaa")
-    for spine in ("bottom", "left"):
-        ax.spines[spine].set_color("#333355")
-    ax.spines["top"].set_visible(False)
-    ax.spines["right"].set_visible(False)
+def is_terminated(data) -> bool:
+    cart_pos   = float(data.qpos[0])
+    pole_angle = float(data.qpos[1])
+    return abs(cart_pos) > CART_LIMIT or abs(pole_angle) > ANGLE_LIMIT
 
-    ep_labels  = [f"EP {i+1}" for i in range(len(rewards))]
-    bar_colors = ["#ffd93d" if i == best_ep else "#4ecdc4" for i in range(len(rewards))]
-    bars = ax.bar(ep_labels, rewards, color=bar_colors, edgecolor="#222244", linewidth=0.6)
 
-    for bar, r in zip(bars, rewards):
-        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 3,
-                f"{r:.0f}", ha="center", va="bottom", color="white", fontsize=9)
+def run_episode(mjmodel, data, actor, ep_num: int, viewer) -> tuple:
+    mujoco.mj_resetData(mjmodel, data)
+    # qpos[0]: 카트 위치 (slider), qpos[1]: 폴 각도 (hinge)
+    data.qpos[0] = np.random.uniform(-INIT_CART_RANGE,  INIT_CART_RANGE)
+    data.qpos[1] = np.random.uniform(-INIT_ANGLE_RAD, INIT_ANGLE_RAD)
+    data.qvel[:] = np.random.uniform(-INIT_VEL_RANGE,   INIT_VEL_RANGE, mjmodel.nv)
+    mujoco.mj_forward(mjmodel, data)
 
-    ax.axhline(500, color="#ff6b6b", linewidth=1.2, linestyle="--", label="최대 보상 (500)")
-    ax.axhline(np.mean(rewards), color="#c3a6ff", linewidth=1.2,
-               linestyle="-.", label=f"평균 {np.mean(rewards):.1f}")
-    ax.set_ylim(0, 540)
-    ax.set_xlabel("에피소드", color="#aaaaaa", fontsize=11)
-    ax.set_ylabel("보상 (스텝 수)", color="#aaaaaa", fontsize=11)
-    ax.set_title("추론 평가 결과 요약  (노란색 = 최고 에피소드)",
-                 color="white", fontsize=13, fontweight="bold")
-    ax.legend(facecolor="#1a1a2e", edgecolor="#333355", labelcolor="white")
+    total_reward   = 0.0
+    step           = 0
+    done           = False
+    state_history  = []   # [(cart_pos, cart_vel, pole_angle, pole_vel), ...]
+    action_history = []   # [motor_force (연속값), ...]
+    last_action    = 0.0
+
+    print(f"\n[에피소드 {ep_num:2d}] 시작")
+
+    while not done and viewer.is_running():
+        step_start = time.perf_counter()
+
+        state  = get_state(data)
+        action = select_action(actor, state)
+
+        # 현재 상태·행동 기록 (mj_step 이전)
+        state_history.append(state.copy())
+        action_history.append(action)
+        last_action = action
+
+        data.ctrl[0] = action
+        mujoco.mj_step(mjmodel, data)
+        step += 1
+
+        viewer.sync()
+
+        state      = get_state(data)
+        terminated = is_terminated(data)
+        done       = terminated or (step >= MAX_STEPS)
+        total_reward += 1.0 if not terminated else 0.0
+
+        # 물리 타임스텝에 맞춰 실시간 페이싱
+        elapsed   = time.perf_counter() - step_start
+        remaining = mjmodel.opt.timestep - elapsed
+        if remaining > 0:
+            time.sleep(remaining)
+
+    result = "성공(최대스텝도달)" if step >= MAX_STEPS else "실패(폴 쓰러짐)"
+    print(f"[에피소드 {ep_num:2d}] {result} | 보상={total_reward:.0f} | "
+          f"스텝={step:3d} | 마지막제어력={last_action:+.2f} N")
+    return total_reward, step, state_history, action_history
+
+
+def save_inference_plots(all_states: list, all_actions: list, timestep: float) -> None:
+    colors = plt.cm.tab10.colors
+    fig, axes = plt.subplots(3, 2, figsize=(13, 11))
+
+    state_labels = ["카트 위치 (m)", "카트 속도 (m/s)", "폴 각도 (deg)", "폴 각속도 (deg/s)"]
+    state_limits = [(-CART_LIMIT,  CART_LIMIT),  None,
+                    (-ANGLE_LIMIT_DEG, ANGLE_LIMIT_DEG),  None]
+
+    for ep_idx, (states, actions) in enumerate(zip(all_states, all_actions)):
+        sa       = np.array(states)              # (T, 4)
+        plot_sa  = sa.copy()
+        plot_sa[:, 2] = np.rad2deg(plot_sa[:, 2])
+        plot_sa[:, 3] = np.rad2deg(plot_sa[:, 3])
+        t        = np.arange(len(sa)) * timestep # 시간 축 (초)
+        c        = colors[ep_idx % len(colors)]
+        lbl      = f"에피소드 {ep_idx + 1}"
+
+        # ── 상태 공간 시계열 ────────────────────────────────────────────────
+        axes[0, 0].plot(t, plot_sa[:, 0], color=c, alpha=0.8, label=lbl)
+        axes[0, 1].plot(t, plot_sa[:, 1], color=c, alpha=0.8, label=lbl)
+        axes[1, 0].plot(t, plot_sa[:, 2], color=c, alpha=0.8, label=lbl)
+        axes[1, 1].plot(t, plot_sa[:, 3], color=c, alpha=0.8, label=lbl)
+
+        # ── 행동 공간 시계열 (연속값 → 일반 line plot) ─────────────────────
+        axes[2, 0].plot(t, actions, color=c, alpha=0.8, label=lbl)
+
+        # ── 위상 궤적: 폴 각도 vs 폴 각속도 ────────────────────────────────
+        axes[2, 1].plot(plot_sa[:, 2], plot_sa[:, 3], color=c, alpha=0.7, label=lbl)
+        axes[2, 1].plot(plot_sa[0, 2], plot_sa[0, 3], "o", color=c, markersize=5)   # 시작점
+
+    # ── 축 설정 ─────────────────────────────────────────────────────────────
+    time_label = "시간 (s)"
+    axes[0, 0].set(title="카트 위치",         xlabel=time_label, ylabel=state_labels[0])
+    axes[0, 1].set(title="카트 속도",         xlabel=time_label, ylabel=state_labels[1])
+    axes[1, 0].set(title="폴 각도",           xlabel=time_label, ylabel=state_labels[2])
+    axes[1, 1].set(title="폴 각속도",         xlabel=time_label, ylabel=state_labels[3])
+    axes[2, 0].set(title="행동 (연속 제어력)", xlabel=time_label, ylabel="제어력 (N)")
+    axes[2, 1].set(title="위상 궤적 (폴)",    xlabel=state_labels[2], ylabel=state_labels[3])
+
+    # 종료 한계선
+    for ax, lim in zip(axes.flat[:4], state_limits):
+        if lim:
+            ax.axhline(lim[0], color="red", linestyle="--", alpha=0.4, linewidth=1)
+            ax.axhline(lim[1], color="red", linestyle="--", alpha=0.4, linewidth=1,
+                       label="종료 한계")
+    axes[2, 0].axhline(0, color="k", linestyle="--", alpha=0.3)
+    axes[2, 0].set_ylim(-ACTION_SCALE * 1.1, ACTION_SCALE * 1.1)
+    axes[2, 1].axvline(-ANGLE_LIMIT_DEG, color="red", linestyle="--", alpha=0.4)
+    axes[2, 1].axvline( ANGLE_LIMIT_DEG, color="red", linestyle="--", alpha=0.4,
+                        label="종료 한계")
+    axes[2, 1].axhline(0, color="k", linestyle="--", alpha=0.3)
+    axes[2, 1].axvline(0, color="k", linestyle="--", alpha=0.3)
+
+    for ax in axes.flat:
+        ax.legend(fontsize=7, loc="upper right")
+        ax.grid(alpha=0.3)
 
     plt.tight_layout()
-    plt.savefig(path, dpi=150, bbox_inches="tight", facecolor="#0f0f0f")
-    print(f"  [저장] 요약 그래프 → {path}")
+    plt.savefig(PLOT_SAVE_PATH, dpi=150)
+    plt.close(fig)
+    print(f"[저장] 추론 결과 그래프 → {PLOT_SAVE_PATH}")
 
 
-# ══════════════════════════════════════════
-# 7. 전체 평가 실행
-# ══════════════════════════════════════════
-def evaluate(model: keras.Model, n_episodes: int = EVAL_EPISODES) -> None:
-    print(f"\n{'='*55}")
-    print(f"  CartPole 추론 평가  ({n_episodes} 에피소드)")
-    print(f"  ESC 또는 창 닫기로 현재 에피소드 중단 가능")
-    print(f"{'='*55}")
+def main():
+    print(f"[장치] {DEVICE}")
+    print(f"[알고리즘] SAC (결정론적 추론 — 분포 평균 사용)")
 
-    # ── pygame 초기화 ────────────────────────
-    pygame.init()
-    # CartPole 기본 렌더 크기는 600×400
-    screen = pygame.display.set_mode((600 * DISPLAY_SCALE, 400 * DISPLAY_SCALE))
-    pygame.display.set_caption("CartPole  DQN Inference")
-    clock  = pygame.time.Clock()
-    font_lg = pygame.font.SysFont(None, 30)
-    font_sm = pygame.font.SysFont(None, 22)
-    env = gym.make("CartPole-v1", render_mode="rgb_array")
-
-    rewards: list[float] = []
-    best_reward  = -1.0
-    best_ep_idx  = 0
-    best_frames: list[np.ndarray] = []
-    best_states: np.ndarray | None = None
-
-    for ep in range(n_episodes):
-        pygame.display.set_caption(
-            f"CartPole  DQN Inference  |  Episode {ep+1}/{n_episodes}"
-        )
-        frames, states, reward, aborted = run_episode(
-            env, model, screen, font_lg, font_sm, clock,
-            seed=ep, ep_num=ep + 1, total_eps=n_episodes,
-        )
-        rewards.append(reward)
-
-        tag = ""
-        if reward > best_reward:
-            best_reward = reward
-            best_ep_idx = ep
-            best_frames = frames
-            best_states = states
-            tag = "  ← 최고"
-        print(f"  에피소드 {ep+1:2d} | 보상: {reward:5.0f} 스텝{tag}")
-
-        if aborted:
-            print("  [중단] 사용자가 창을 닫았습니다.")
-            break
-
-    env.close()
-    pygame.quit()
-
-    if not rewards:
+    if not os.path.exists(MODEL_ACTOR_PATH):
+        print(f"[오류] 모델 파일 없음: {MODEL_ACTOR_PATH}")
+        print("  먼저 train.py를 실행하여 모델을 학습하세요.")
         return
 
-    print(f"\n  평균 보상 : {np.mean(rewards):.1f}")
-    print(f"  최고 보상 : {best_reward:.0f}  (에피소드 {best_ep_idx+1})")
+    actor   = load_actor(MODEL_ACTOR_PATH)
+    mjmodel = mujoco.MjModel.from_xml_path(XML_PATH)
+    data    = mujoco.MjData(mjmodel)
+    results     = []
+    all_states  = []
+    all_actions = []
 
-    # ── 파일 저장 ────────────────────────────
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    save_gif(best_frames, GIF_PATH)
-    plot_states(best_states, best_reward, STATES_PLOT_PATH)
-    plot_summary(rewards, best_ep_idx, SUMMARY_PLOT_PATH)
+    print(f"[추론] {N_EPISODES}개 에피소드 실행 (뷰어 창 닫기로 종료)\n")
 
-    print(f"\n{'='*55}")
-    print("  출력 파일")
-    print(f"  - GIF        : {GIF_PATH}")
-    print(f"  - 상태 그래프  : {STATES_PLOT_PATH}")
-    print(f"  - 요약 그래프  : {SUMMARY_PLOT_PATH}")
-    print(f"{'='*55}\n")
+    with mujoco.viewer.launch_passive(mjmodel, data) as viewer:
+        for ep in range(1, N_EPISODES + 1):
+            if not viewer.is_running():
+                break
+
+            reward, steps, states, actions = run_episode(mjmodel, data, actor, ep, viewer)
+            results.append((reward, steps))
+            all_states.append(states)
+            all_actions.append(actions)
+
+            # 에피소드 종료 후 잠시 현재 상태 유지 (결과 확인용)
+            pause_end = time.perf_counter() + EPISODE_PAUSE
+            while time.perf_counter() < pause_end and viewer.is_running():
+                viewer.sync()
+                time.sleep(0.01)
+
+    if results:
+        rewards, steps_list = zip(*results)
+        sep = "=" * 45
+        print(f"\n{sep}")
+        print(f"[최종 결과] {len(results)}개 에피소드")
+        print(f"  평균 보상 : {np.mean(rewards):.1f}")
+        print(f"  최대 보상 : {np.max(rewards):.0f}")
+        print(f"  성공 횟수 : {sum(s >= MAX_STEPS for s in steps_list)}/{len(results)}")
+        print(f"  평균 스텝 : {np.mean(steps_list):.1f}")
+        print(sep)
+
+        save_inference_plots(all_states, all_actions, timestep=mjmodel.opt.timestep)
 
 
-# ══════════════════════════════════════════
-# 실행
-# ══════════════════════════════════════════
 if __name__ == "__main__":
-    print(f"  device : {DEVICE}")
-    print(f"  모델 로드 : {BEST_MODEL_PATH}")
-
-    model, metadata = load_model(BEST_MODEL_PATH)
-    print(f"  model device : {model_device(model)}")
-    if metadata:
-        print(
-            f"  학습 에피소드 : {metadata['episode']}  |  "
-            f"학습 시 보상 : {metadata['reward']:.0f}"
-        )
-
-    evaluate(model, n_episodes=EVAL_EPISODES)
+    main()

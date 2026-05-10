@@ -1,344 +1,391 @@
-"""
-Train a DQN (Deep Q-Network) agent on CartPole.
-
-The training loop uses shaped reward consistently for:
-1. DQN updates
-2. best-model saving
-3. success detection
-4. training plots
-"""
-
 import os
-os.environ["KERAS_BACKEND"] = "torch"  # must be set before importing keras
-
-from collections import deque
-from pathlib import Path
 import random
-
-import gymnasium as gym
+import collections
+import numpy as np
+import mujoco
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import numpy as np
+import matplotlib.font_manager as fm
 import torch
-import torch.nn as nn
+import torch.nn.functional as F
+from torch.distributions import Normal
+
+os.environ["KERAS_BACKEND"] = "torch"
 import keras
 
+if any(font.name == "Malgun Gothic" for font in fm.fontManager.ttflist):
+    plt.rcParams["font.family"] = "Malgun Gothic"
+plt.rcParams["axes.unicode_minus"] = False
 
-OUTPUT_DIR = Path(__file__).resolve().parent / "outputs"
-RESULT_IMAGE_PATH = OUTPUT_DIR / "dqn_cartpole_result.png"
-BEST_MODEL_PATH = OUTPUT_DIR / "best_model.keras"
+# ══════════════════════════════════ 설정 ══════════════════════════════════════
+# ── 실행 설정 ────────────────────────────────────────────────────────────────
+N_EPISODES     = 1000      # 총 학습 에피소드 수
+PRINT_INTERVAL = 50        # 상태 출력 에피소드 간격
+MAX_STEPS      = 500       # 에피소드 최대 스텝
 
-# Shaped reward threshold for saving and success detection.
-SAVE_REWARD_THRESHOLD = 400
+# ── 리플레이 메모리 / 배치 ──────────────────────────────────────────────────
+BATCH_SIZE  = 64           # 미니배치 크기
+MEMORY_SIZE = 10_000       # 리플레이 메모리 크기
 
-# if matplotlib.get_backend().lower() == "agg":
-#     matplotlib.rcParams["font.family"] = ["Malgun Gothic", "DejaVu Sans"]
-#     matplotlib.rcParams["axes.unicode_minus"] = False
+# ── SAC 학습 하이퍼파라미터 ─────────────────────────────────────────────────
+GAMMA          = 0.99      # 할인율
+ACTOR_LR       = 3e-4      # Actor 학습률
+CRITIC_LR      = 3e-4      # Critic 학습률
+ALPHA_LR       = 3e-4      # 온도 파라미터(α) 학습률
+TAU            = 0.005     # 소프트 타겟 업데이트 계수
+LOG_ALPHA_INIT = 0.0       # 초기 온도: α = exp(0) = 1.0
 
+# ── Actor 출력 / 행동 공간 ──────────────────────────────────────────────────
+ACTION_SCALE   = 10.0      # 모터 제어력 범위 [-10, 10]
+ACTION_DIM     = 1         # 연속 행동 차원
+LOG_STD_MIN    = -20       # log_std 하한
+LOG_STD_MAX    = 2         # log_std 상한
+TARGET_ENTROPY = -float(ACTION_DIM)  # 목표 엔트로피 (휴리스틱: -dim(A))
 
-# Fixed seeds for reproducible runs.
-SEED = 42
-random.seed(SEED)
-np.random.seed(SEED)
-torch.manual_seed(SEED)
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-if DEVICE.type == "cuda":
-    torch.cuda.manual_seed_all(SEED)
+# ── 환경 종료 조건 ──────────────────────────────────────────────────────────
+SOFT_CART_LIMIT = 1.5      # 카트 위치 제어 실패 한계 [-1.5, 1.5] m
+ANGLE_LIMIT_DEG = 90       # 폴 각도 실패 한계 [-90, 90] deg
+ANGLE_LIMIT_RAD = np.deg2rad(ANGLE_LIMIT_DEG)
 
+# ── 초기 상태 랜덤화 ────────────────────────────────────────────────────────
+INIT_CART_RANGE = 0.5      # 초기 카트 위치 범위 [-0.5, 0.5] m
+INIT_ANGLE_DEG  = 45       # 초기 폴 각도 범위 [-45, 45] deg
+INIT_ANGLE_RAD  = np.deg2rad(INIT_ANGLE_DEG)
+INIT_VEL_RANGE  = 0.1      # 초기 속도 범위 [-0.1, 0.1]
 
-# Hyperparameters.
-EPISODES = 1000
-GAMMA = 0.99
-EPSILON_START = 1.0
-EPSILON_END = 0.01
-EPSILON_DECAY = 0.995
-LR = 1e-3
-BATCH_SIZE = 64
-BUFFER_SIZE = 10_000
-TARGET_UPDATE = 10
-HIDDEN_SIZE = 256
+# ── 저장 경로 ───────────────────────────────────────────────────────────────
+MODEL_ACTOR_PATH   = "best_actor.weights.h5"
+MODEL_CRITIC1_PATH = "best_critic1.weights.h5"
+MODEL_CRITIC2_PATH = "best_critic2.weights.h5"
+PLOT_SAVE_PATH     = "training_result.png"
 
-# Position-based reward shaping.
-# A small penalty is subtracted as the cart moves away from the center.
-POSITION_PENALTY_COEFF = 0.8
-CART_POS_LIMIT = 2.4
+# ── 파생 설정 / 런타임 설정 ─────────────────────────────────────────────────
+_DIR     = os.path.dirname(os.path.abspath(__file__))
+XML_PATH = os.path.join(_DIR, "cartpole.xml")
 
-# Render a live episode every N training episodes (0 = disabled).
-RENDER_EVERY = 0
-
-
-def build_model(state_size: int, action_size: int) -> keras.Model:
-    """Small MLP that predicts Q-values for each CartPole action.
-
-    With KERAS_BACKEND=torch the returned model is also a torch.nn.Module,
-    so model.parameters(), torch.optim, and autograd all work as usual.
-    """
-    return keras.Sequential([
-        keras.layers.Input(shape=(state_size,)),
-        keras.layers.Dense(HIDDEN_SIZE, activation="gelu"),
-        keras.layers.Dense(HIDDEN_SIZE, activation="gelu"),
-        keras.layers.Dense(action_size),
-    ])
+N_STATES        = 4   # [카트위치, 카트속도, 폴각도, 폴각속도]
+DEVICE          = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# ═════════════════════════════════════════════════════════════════════════════
 
 
-def model_device(model: nn.Module) -> torch.device:
-    """Return the device of the first trainable parameter."""
-    return next(model.parameters()).device
-
-
-class ReplayBuffer:
-    """Stores past transitions and samples random mini-batches."""
-
+class ReplayMemory:
     def __init__(self, capacity: int):
-        self.buffer = deque(maxlen=capacity)
+        self.buffer = collections.deque(maxlen=capacity)
 
-    def push(self, state, action, reward, next_state, done) -> None:
-        self.buffer.append((state, action, reward, next_state, done))
+    def put(self, state, action: float, reward: float, next_state, done_mask: float):
+        self.buffer.append((
+            np.asarray(state,      dtype=np.float32),
+            np.float32(action),
+            np.float32(reward),
+            np.asarray(next_state, dtype=np.float32),
+            np.float32(done_mask),
+        ))
 
-    def sample(self, batch_size: int):
-        batch = random.sample(self.buffer, batch_size)
-        states, actions, rewards, next_states, dones = zip(*batch)
+    def sample(self, n: int):
+        batch = random.sample(self.buffer, n)
+        s, a, r, ns, dm = zip(*batch)
+        _t = lambda x, dt: torch.tensor(np.array(x), dtype=dt).to(DEVICE)
         return (
-            np.array(states, dtype=np.float32),
-            np.array(actions, dtype=np.int32),
-            np.array(rewards, dtype=np.float32),
-            np.array(next_states, dtype=np.float32),
-            np.array(dones, dtype=np.float32),
+            _t(s,  torch.float32),
+            _t(a,  torch.float32).unsqueeze(1),
+            _t(r,  torch.float32).unsqueeze(1),
+            _t(ns, torch.float32),
+            _t(dm, torch.float32).unsqueeze(1),
         )
 
     def __len__(self) -> int:
         return len(self.buffer)
 
 
-class DQNAgent:
-    """Owns the policy network, target network, optimizer, and replay buffer."""
+class CartPoleEnv:
+    _CART_LIMIT  = 2.4
+    _ANGLE_LIMIT = ANGLE_LIMIT_RAD
 
-    def __init__(self, state_size: int, action_size: int):
-        self.action_size = action_size
-        self.epsilon = EPSILON_START
+    def __init__(self, xml_path: str, max_steps: int = MAX_STEPS):
+        self.model     = mujoco.MjModel.from_xml_path(xml_path)
+        self.data      = mujoco.MjData(self.model)
+        self.max_steps = max_steps
+        self._steps    = 0
 
-        self.policy_net = build_model(state_size, action_size).to(DEVICE)
-        self.target_net = build_model(state_size, action_size).to(DEVICE)
-        self.target_net.set_weights(self.policy_net.get_weights())
+    def reset(self) -> np.ndarray:
+        mujoco.mj_resetData(self.model, self.data)
+        # qpos[0]: 카트 위치 (slider), qpos[1]: 폴 각도 (hinge)
+        self.data.qpos[0] = np.random.uniform(-INIT_CART_RANGE,  INIT_CART_RANGE)
+        self.data.qpos[1] = np.random.uniform(-INIT_ANGLE_RAD, INIT_ANGLE_RAD)
+        self.data.qvel[:] = np.random.uniform(-INIT_VEL_RANGE,   INIT_VEL_RANGE, self.model.nv)
+        mujoco.mj_forward(self.model, self.data)
+        self._steps = 0
+        return self._get_state()
 
-        # Keras+torch model is a torch.nn.Module → use torch optimizer directly.
-        self.optimizer = torch.optim.Adam(self.policy_net.parameters(), lr=LR)
-        self.buffer = ReplayBuffer(BUFFER_SIZE)
+    def step(self, action: float):
+        self.data.ctrl[0] = float(np.clip(action, -ACTION_SCALE, ACTION_SCALE))
+        mujoco.mj_step(self.model, self.data)
+        self._steps += 1
 
-    def select_action(self, state) -> int:
-        """Select an action using epsilon-greedy exploration."""
-        if random.random() < self.epsilon:
-            return random.randrange(self.action_size)
-        with torch.no_grad():
-            state_t = torch.as_tensor(state, dtype=torch.float32, device=DEVICE).unsqueeze(0)
-            return int(self.policy_net(state_t).argmax().item())
+        state      = self._get_state()
+        cart_pos   = float(self.data.qpos[0])
+        pole_angle = float(self.data.qpos[1])
+        terminated = (abs(cart_pos) > SOFT_CART_LIMIT or
+                      abs(pole_angle) > self._ANGLE_LIMIT)
+        done       = terminated or (self._steps >= self.max_steps)
+        if terminated:
+            reward = 0.0
+        else:
+            position_penalty = (cart_pos / self._CART_LIMIT) ** 2
+            reward = 1.0 - position_penalty
+        return state, reward, done
 
-    def learn(self) -> None:
-        """Update the Q-network from one sampled replay mini-batch."""
-        if len(self.buffer) < BATCH_SIZE:
-            return
-
-        states, actions, rewards, next_states, dones = self.buffer.sample(BATCH_SIZE)
-
-        states_t      = torch.as_tensor(states,      device=DEVICE)
-        actions_t     = torch.as_tensor(actions,     dtype=torch.long, device=DEVICE)
-        rewards_t     = torch.as_tensor(rewards,     device=DEVICE)
-        next_states_t = torch.as_tensor(next_states, device=DEVICE)
-        dones_t       = torch.as_tensor(dones,       device=DEVICE)
-
-        with torch.no_grad():
-            next_q   = self.target_net(next_states_t).max(dim=1).values
-            target_q = rewards_t + GAMMA * next_q * (1 - dones_t)
-
-        self.optimizer.zero_grad()
-        q_values  = self.policy_net(states_t)
-        current_q = q_values.gather(1, actions_t.unsqueeze(1)).squeeze(1)
-        loss      = nn.HuberLoss()(current_q, target_q)
-        loss.backward()
-        nn.utils.clip_grad_norm_(self.policy_net.parameters(), 1.0)
-        self.optimizer.step()
-
-    def update_target(self) -> None:
-        self.target_net.set_weights(self.policy_net.get_weights())
-
-    def decay_epsilon(self) -> None:
-        self.epsilon = max(EPSILON_END, self.epsilon * EPSILON_DECAY)
+    def _get_state(self) -> np.ndarray:
+        # sensordata 순서: [카트위치, 카트속도, 폴각도, 폴각속도]
+        return self.data.sensordata.copy().astype(np.float32)
 
 
-def calculate_shaped_reward(env_reward: float, next_state) -> float:
-    """Return environment reward minus a cart-position penalty."""
-    pos_ratio = abs(next_state[0]) / CART_POS_LIMIT
-    return float(env_reward - POSITION_PENALTY_COEFF * (pos_ratio ** 2))
+# ── Actor: 상태 → (mean, log_std) ─────────────────────────────────────────────
+# Sequential 단일 출력(ACTION_DIM * 2)을 sample_action에서 분리
+def build_actor() -> keras.Model:
+    return keras.Sequential([
+        keras.layers.Input(shape=(N_STATES,)),
+        keras.layers.Dense(256, activation="gelu"),
+        keras.layers.Dense(256, activation="gelu"),
+        keras.layers.Dense(ACTION_DIM * 2),   # 전반부: mean / 후반부: log_std
+    ])
 
 
-def render_episode(agent: "DQNAgent") -> float:
-    """Run one greedy episode with a human-render window to visualise current policy."""
-    render_env = gym.make("CartPole-v1", render_mode="human")
-    state, _ = render_env.reset()
-    total_reward = 0.0
-    for _ in range(500):
-        with torch.no_grad():
-            state_t = torch.as_tensor(state, dtype=torch.float32, device=DEVICE).unsqueeze(0)
-            action = int(agent.policy_net(state_t).argmax().item())
-        state, reward, terminated, truncated, _ = render_env.step(action)
-        total_reward += reward
-        if terminated or truncated:
-            break
-    render_env.close()
-    return total_reward
+# ── Critic: concat(상태, 행동) → Q값 ──────────────────────────────────────────
+def build_critic() -> keras.Model:
+    return keras.Sequential([
+        keras.layers.Input(shape=(N_STATES + ACTION_DIM,)),
+        keras.layers.Dense(256, activation="gelu"),
+        keras.layers.Dense(256, activation="gelu"),
+        keras.layers.Dense(1),
+    ])
 
 
-def train():
-    env = gym.make("CartPole-v1")
-    state_size = int(env.observation_space.shape[0])
-    action_size = int(env.action_space.n)
+def init_networks():
+    actor          = build_actor()
+    critic1        = build_critic()
+    critic2        = build_critic()
+    critic1_target = build_critic()
+    critic2_target = build_critic()
 
-    agent = DQNAgent(state_size, action_size)
-    print(f"device: {DEVICE}")
+    dummy_s  = torch.zeros(1, N_STATES)
+    dummy_sa = torch.zeros(1, N_STATES + ACTION_DIM)
+    actor(dummy_s)
+    critic1(dummy_sa);        critic2(dummy_sa)
+    critic1_target(dummy_sa); critic2_target(dummy_sa)
+
     if DEVICE.type == "cuda":
-        print(f"GPU: {torch.cuda.get_device_name(0)}")
-    print(f"policy_net device: {model_device(agent.policy_net)}")
-    print(f"target_net device: {model_device(agent.target_net)}")
+        actor.cuda()
+        critic1.cuda();        critic2.cuda()
+        critic1_target.cuda(); critic2_target.cuda()
 
-    rewards_history = []
-    avg_history = []
-    best_episode_reward = 0
+    critic1_target.set_weights(critic1.get_weights())
+    critic2_target.set_weights(critic2.get_weights())
 
-    print("=" * 55)
-    print("  DQN CartPole training started")
-    print("=" * 55)
-
-    for episode in range(1, EPISODES + 1):
-        state, _ = env.reset(seed=episode)
-        total_env_reward = 0
-        total_shaped_reward = 0.0
-
-        for _ in range(500):
-            action = agent.select_action(state)
-            next_state, reward, terminated, truncated, _ = env.step(action)
-            done = terminated or truncated
-
-            shaped_reward = calculate_shaped_reward(reward, next_state)
-            agent.buffer.push(state, action, shaped_reward, next_state, float(done))
-            agent.learn()
-
-            state = next_state
-            total_env_reward += reward
-            total_shaped_reward += shaped_reward
-
-            if done:
-                break
-
-        agent.decay_epsilon()
-        if episode % TARGET_UPDATE == 0:
-            agent.update_target()
-
-        rewards_history.append(total_shaped_reward)
-        avg = np.mean(rewards_history[-50:])
-        avg_history.append(avg)
-
-        if total_shaped_reward >= SAVE_REWARD_THRESHOLD and total_shaped_reward > best_episode_reward:
-            best_episode_reward = total_shaped_reward
-            OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-            agent.policy_net.save(BEST_MODEL_PATH)
-            print(
-                f"  [model saved] episode {episode:4d} | "
-                f"shaped: {total_shaped_reward:.1f} | "
-                f"env: {total_env_reward:.0f} -> {BEST_MODEL_PATH}"
-            )
-
-        if episode % 50 == 0:
-            print(
-                f"  episode {episode:4d} | "
-                f"shaped: {total_shaped_reward:6.1f} | "
-                f"env: {total_env_reward:6.1f} | "
-                f"avg(50): {avg:6.1f} | "
-                f"epsilon: {agent.epsilon:.3f}"
-            )
-
-        if RENDER_EVERY and episode % RENDER_EVERY == 0:
-            vis_reward = render_episode(agent)
-            print(f"  [render] episode {episode:4d} | greedy env reward: {vis_reward:.0f}")
-
-        # if avg >= SAVE_REWARD_THRESHOLD and episode >= 50:
-        #     print(f"\n  [success] episode {episode} | shaped avg: {avg:.1f}")
-        #     break
-
-    env.close()
-    return rewards_history, avg_history, agent
-
-
-def plot_results(rewards, avgs) -> None:
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-    fig.patch.set_facecolor("#0f0f0f")
-
-    for ax in axes:
-        ax.set_facecolor("#1a1a2e")
-        ax.tick_params(colors="#aaaaaa")
-        ax.spines["bottom"].set_color("#333355")
-        ax.spines["left"].set_color("#333355")
-        ax.spines["top"].set_visible(False)
-        ax.spines["right"].set_visible(False)
-
-    episodes = range(1, len(rewards) + 1)
-
-    axes[0].fill_between(episodes, rewards, alpha=0.3, color="#4ecdc4")
-    axes[0].plot(episodes, rewards, color="#4ecdc4", linewidth=0.8, alpha=0.7)
-    axes[0].plot(episodes, avgs, color="#ff6b6b", linewidth=2.0, label="50 episode average")
-    axes[0].axhline(
-        y=SAVE_REWARD_THRESHOLD,
-        color="#ffd93d",
-        linestyle="--",
-        linewidth=1.2,
-        label=f"success threshold ({SAVE_REWARD_THRESHOLD})",
+    log_alpha = torch.tensor(
+        [LOG_ALPHA_INIT], dtype=torch.float32, requires_grad=True, device=DEVICE
     )
-    axes[0].set_xlabel("Episode", color="#aaaaaa", fontsize=11)
-    axes[0].set_ylabel("Shaped reward", color="#aaaaaa", fontsize=11)
-    axes[0].set_title("Training Curve", color="white", fontsize=13, fontweight="bold")
-    axes[0].legend(facecolor="#1a1a2e", edgecolor="#333355", labelcolor="white")
+    return actor, critic1, critic2, critic1_target, critic2_target, log_alpha
 
-    axes[1].plot(episodes, avgs, color="#ff6b6b", linewidth=2.5)
-    axes[1].fill_between(episodes, avgs, alpha=0.2, color="#ff6b6b")
-    axes[1].axhline(
-        y=SAVE_REWARD_THRESHOLD,
-        color="#ffd93d",
-        linestyle="--",
-        linewidth=1.2,
-        label=f"success threshold ({SAVE_REWARD_THRESHOLD})",
-    )
-    axes[1].set_xlabel("Episode", color="#aaaaaa", fontsize=11)
-    axes[1].set_ylabel("Average shaped reward", color="#aaaaaa", fontsize=11)
-    axes[1].set_title("Moving Average (50 Episodes)", color="white", fontsize=13, fontweight="bold")
-    axes[1].legend(facecolor="#1a1a2e", edgecolor="#333355", labelcolor="white")
 
-    last_avg = avgs[-1]
-    axes[1].annotate(
-        f"final avg: {last_avg:.1f}",
-        xy=(len(avgs), last_avg),
-        xytext=(-80, 15),
-        textcoords="offset points",
-        color="white",
-        fontsize=10,
-        arrowprops=dict(arrowstyle="->", color="#aaaaaa"),
-    )
+def soft_update(src: keras.Model, tgt: keras.Model) -> None:
+    src_weights = src.get_weights()
+    tgt_weights = tgt.get_weights()
+    tgt.set_weights([
+        TAU * src_w + (1.0 - TAU) * tgt_w
+        for src_w, tgt_w in zip(src_weights, tgt_weights)
+    ])
 
-    plt.suptitle("DQN CartPole Training Result", color="white", fontsize=15, fontweight="bold", y=1.02)
+
+def sample_action(actor: keras.Model, states: torch.Tensor, deterministic: bool = False):
+    """
+    재매개변수화 트릭으로 행동 샘플링.
+    반환: (action, log_prob)  — deterministic=True 시 log_prob=None
+    """
+    out     = actor(states)                              # (B, ACTION_DIM * 2)
+    mean    = out[:, :ACTION_DIM]
+    log_std = out[:, ACTION_DIM:].clamp(LOG_STD_MIN, LOG_STD_MAX)
+    std     = log_std.exp()
+
+    if deterministic:
+        action = torch.tanh(mean) * ACTION_SCALE
+        return action, None
+
+    dist  = Normal(mean, std)
+    x_t   = dist.rsample()                              # 재매개변수화 샘플
+    y_t   = torch.tanh(x_t)
+    action = y_t * ACTION_SCALE
+
+    # tanh squashing 보정이 포함된 로그 확률
+    log_prob = dist.log_prob(x_t) - torch.log(ACTION_SCALE * (1 - y_t.pow(2)) + 1e-6)
+    log_prob = log_prob.sum(dim=1, keepdim=True)
+    return action, log_prob
+
+
+def select_action(actor: keras.Model, state: np.ndarray) -> float:
+    """학습 중 환경 상호작용 시 확률론적으로 행동 선택."""
+    x = torch.from_numpy(state).unsqueeze(0).to(DEVICE)
+    with torch.no_grad():
+        action, _ = sample_action(actor, x, deterministic=False)
+    return float(action.squeeze())
+
+
+def train_step(actor, critic1, critic2, critic1_target, critic2_target,
+               memory, actor_opt, critic1_opt, critic2_opt, log_alpha, alpha_opt):
+    states, actions, rewards, next_states, done_masks = memory.sample(BATCH_SIZE)
+    alpha = log_alpha.exp().detach()
+
+    # ── Critic 업데이트 ─────────────────────────────────────────────────────
+    with torch.no_grad():
+        next_actions, next_log_probs = sample_action(actor, next_states)
+        sa_next = torch.cat([next_states, next_actions], dim=1)
+        q_next  = torch.min(critic1_target(sa_next),
+                            critic2_target(sa_next)) - alpha * next_log_probs
+        target  = rewards + GAMMA * q_next * done_masks
+
+    sa      = torch.cat([states, actions], dim=1)
+    c1_loss = F.huber_loss(critic1(sa), target)
+    c2_loss = F.huber_loss(critic2(sa), target)
+
+    critic1_opt.zero_grad(); c1_loss.backward(); critic1_opt.step()
+    critic2_opt.zero_grad(); c2_loss.backward(); critic2_opt.step()
+
+    # ── Actor 업데이트 (critic 가중치 고정: actor gradient만 계산) ───────────
+    for p in list(critic1.parameters()) + list(critic2.parameters()):
+        p.requires_grad = False
+
+    pi, log_pi = sample_action(actor, states)
+    sa_pi      = torch.cat([states, pi], dim=1)
+    actor_loss = (alpha * log_pi - torch.min(critic1(sa_pi), critic2(sa_pi))).mean()
+
+    actor_opt.zero_grad(); actor_loss.backward(); actor_opt.step()
+
+    for p in list(critic1.parameters()) + list(critic2.parameters()):
+        p.requires_grad = True
+
+    # ── 온도 파라미터(α) 업데이트 ────────────────────────────────────────────
+    alpha_loss = -(log_alpha * (log_pi.detach() + TARGET_ENTROPY)).mean()
+    alpha_opt.zero_grad(); alpha_loss.backward(); alpha_opt.step()
+
+    # ── 소프트 타겟 업데이트 ────────────────────────────────────────────────
+    soft_update(critic1, critic1_target)
+    soft_update(critic2, critic2_target)
+
+    return (c1_loss.item() + c2_loss.item()) / 2, actor_loss.item(), log_alpha.exp().item()
+
+
+def save_plots(rewards: list, critic_losses: list, actor_losses: list,
+               alphas: list) -> None:
+    eps = np.arange(1, len(rewards) + 1)
+    win = 50
+
+    fig, axes = plt.subplots(2, 2, figsize=(12, 9))
+    (ax1, ax2), (ax3, ax4) = axes
+
+    def plot_with_ma(ax, data, color, label, title, ylabel):
+        ax.plot(eps, data, alpha=0.35, color=color)
+        if len(data) >= win:
+            ma = np.convolve(data, np.ones(win) / win, mode="valid")
+            ax.plot(eps[win - 1:], ma, color=color, label=f"{label} ({win}ep MA)")
+        ax.set(title=title, xlabel="에피소드", ylabel=ylabel)
+        ax.legend(); ax.grid(alpha=0.3)
+
+    plot_with_ma(ax1, rewards,       "steelblue", "보상",       "학습 보상 추이",        "누적 보상")
+    plot_with_ma(ax2, critic_losses, "tomato",    "Critic 손실", "Critic 손실 추이",      "Huber 손실")
+    plot_with_ma(ax3, actor_losses,  "seagreen",  "Actor 손실",  "Actor 손실 추이",       "손실 (α·H - Q)")
+    plot_with_ma(ax4, alphas,        "orchid",    "α",           "온도 파라미터(α) 추이", "α 값")
+
     plt.tight_layout()
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    plt.savefig(RESULT_IMAGE_PATH, dpi=150, bbox_inches="tight", facecolor="#0f0f0f")
-    print(f"\n  [saved] training result plot: {RESULT_IMAGE_PATH}")
+    plt.savefig(PLOT_SAVE_PATH, dpi=150)
+    plt.close(fig)
+    print(f"[저장] 학습 결과 그래프 → {PLOT_SAVE_PATH}")
+
+
+def main():
+    print(f"[장치] {DEVICE}")
+    print(f"[알고리즘] SAC (Soft Actor-Critic)")
+    print(f"[설정] 에피소드={N_EPISODES} | 배치={BATCH_SIZE} | γ={GAMMA} | τ={TAU}")
+    print(f"       actor_lr={ACTOR_LR} | critic_lr={CRITIC_LR} | alpha_lr={ALPHA_LR}")
+    print(f"       목표엔트로피={TARGET_ENTROPY} | 초기α={np.exp(LOG_ALPHA_INIT):.3f}")
+
+    env    = CartPoleEnv(XML_PATH)
+    memory = ReplayMemory(MEMORY_SIZE)
+    actor, critic1, critic2, critic1_target, critic2_target, log_alpha = init_networks()
+
+    actor_opt  = torch.optim.Adam(actor.parameters(),   lr=ACTOR_LR)
+    critic1_opt = torch.optim.Adam(critic1.parameters(), lr=CRITIC_LR)
+    critic2_opt = torch.optim.Adam(critic2.parameters(), lr=CRITIC_LR)
+    alpha_opt  = torch.optim.Adam([log_alpha],           lr=ALPHA_LR)
+
+    best_reward = float("-inf")
+    ep_rewards, ep_c_losses, ep_a_losses, ep_alphas = [], [], [], []
+
+    sep = "=" * 75
+    hdr = (f"{'에피소드':>10} | {'평균보상':>9} | {'Critic손실':>11} | "
+           f"{'Actor손실':>10} | {'α':>7} | {'메모리':>7}")
+    print(sep); print(hdr); print(sep)
+
+    for ep in range(1, N_EPISODES + 1):
+        state        = env.reset()
+        total_reward = 0.0
+        c_loss_sum   = 0.0
+        a_loss_sum   = 0.0
+        alpha_sum    = 0.0
+        loss_cnt     = 0
+        done         = False
+
+        while not done:
+            action                   = select_action(actor, state)
+            next_state, reward, done = env.step(action)
+            done_mask                = 0.0 if done else 1.0
+            memory.put(state, action, reward, next_state, done_mask)
+            state        = next_state
+            total_reward += reward
+
+            if len(memory) >= BATCH_SIZE:
+                c_loss, a_loss, alpha_val = train_step(
+                    actor, critic1, critic2, critic1_target, critic2_target,
+                    memory, actor_opt, critic1_opt, critic2_opt, log_alpha, alpha_opt,
+                )
+                c_loss_sum += c_loss
+                a_loss_sum += a_loss
+                alpha_sum  += alpha_val
+                loss_cnt   += 1
+
+        avg_c = c_loss_sum / loss_cnt if loss_cnt > 0 else float("nan")
+        avg_a = a_loss_sum / loss_cnt if loss_cnt > 0 else float("nan")
+        avg_alpha = alpha_sum / loss_cnt if loss_cnt > 0 else np.exp(LOG_ALPHA_INIT)
+
+        ep_rewards.append(total_reward)
+        ep_c_losses.append(avg_c   if loss_cnt > 0 else 0.0)
+        ep_a_losses.append(avg_a   if loss_cnt > 0 else 0.0)
+        ep_alphas.append(avg_alpha)
+
+        # 보상이 개선된 경우 모델 저장
+        if total_reward > best_reward:
+            best_reward = total_reward
+            actor.save_weights(MODEL_ACTOR_PATH)
+            critic1.save_weights(MODEL_CRITIC1_PATH)
+            critic2.save_weights(MODEL_CRITIC2_PATH)
+            print(f"  ↑ [모델 저장] ep={ep:4d}  보상={total_reward:.2f}  α={avg_alpha:.4f}")
+
+        if ep % PRINT_INTERVAL == 0:
+            recent_r  = ep_rewards[-PRINT_INTERVAL:]
+            recent_cl = [l for l in ep_c_losses[-PRINT_INTERVAL:] if l > 0]
+            recent_al = [l for l in ep_a_losses[-PRINT_INTERVAL:] if l != 0.0]
+            recent_alpha = [a for a in ep_alphas[-PRINT_INTERVAL:]]
+            avg_r  = np.mean(recent_r)
+            avg_cl = np.mean(recent_cl)    if recent_cl    else float("nan")
+            avg_al = np.mean(recent_al)    if recent_al    else float("nan")
+            avg_al_val = np.mean(recent_alpha)
+            print(f"{ep:>10d} | {avg_r:>9.2f} | {avg_cl:>11.6f} | "
+                  f"{avg_al:>10.6f} | {avg_al_val:>7.4f} | {len(memory):>7d}")
+
+    print(sep)
+    print("[학습 완료]")
+    save_plots(ep_rewards, ep_c_losses, ep_a_losses, ep_alphas)
 
 
 if __name__ == "__main__":
-    rewards, avgs, agent = train()
-    plot_results(rewards, avgs)
-
-    print("\n" + "=" * 55)
-    print(f"  total training episodes : {len(rewards)}")
-    print(f"  best shaped reward      : {max(rewards):.1f}")
-    print(f"  final shaped avg        : {avgs[-1]:.1f}")
-    print(f"  final epsilon           : {agent.epsilon:.3f}")
-    if BEST_MODEL_PATH.exists():
-        print(f"  model path              : {BEST_MODEL_PATH}")
-    print("=" * 55)
+    main()

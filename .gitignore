@@ -125,3 +125,6 @@ dmypy.json
 
 # tensorbaord log file
 /runs
+
+# pycharm enviroment
+.idea

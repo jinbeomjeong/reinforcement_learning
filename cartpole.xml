@@ -1,0 +1,56 @@
+<mujoco model="cartpole">
+
+  <compiler angle="radian" />
+
+  <option gravity="0 0 -9.81" timestep="0.01" integrator="RK4" />
+
+  <default>
+    <joint damping="0.05" />
+    <geom contype="1" conaffinity="1" friction="0.8 0.01 0.001" />
+  </default>
+
+  <worldbody>
+
+    <!-- 레일 (시각적 참조용) -->
+    <geom name="rail" type="capsule" pos="0 0 0.05"
+          size="0.02 2.0" euler="0 1.5708 0"
+          rgba="0.4 0.4 0.4 0.5" contype="0" conaffinity="0" />
+
+    <!-- 카트 -->
+    <body name="cart" pos="0 0 0.1">
+      <!-- 카트가 x축을 따라 슬라이드 -->
+      <joint name="slider" type="slide" axis="1 0 0"
+             range="-2.4 2.4" damping="0.1" />
+      <geom name="cart_geom" type="box" size="0.2 0.1 0.07"
+            rgba="0.2 0.5 0.9 1.0" mass="1.0" />
+
+      <!-- 폴 (카트 위에서 회전) -->
+      <body name="pole" pos="0 0 0.07">
+        <!-- 폴이 카트에서 힌지 회전 -->
+        <joint name="hinge" type="hinge" axis="0 1 0"
+               range="-3.14159 3.14159" damping="0.05" />
+        <!-- 폴 (원점에서 위로 0.3m) -->
+        <geom name="pole_geom" type="capsule" fromto="0 0 0  0 0 0.6"
+              size="0.02" rgba="0.9 0.3 0.2 1.0" mass="0.1" />
+        <!-- 폴 끝 질량점 (시각화용) -->
+        <geom name="pole_tip" type="sphere" pos="0 0 0.6"
+              size="0.04" rgba="1.0 0.8 0.0 1.0" mass="0.01" />
+      </body>
+    </body>
+
+  </worldbody>
+
+  <actuator>
+    <!-- 카트에 수평 힘 적용 (force actuator) -->
+    <motor name="slide_motor" joint="slider"
+           gear="1" ctrllimited="true" ctrlrange="-10 10" />
+  </actuator>
+
+  <sensor>
+    <jointpos name="cart_pos"  joint="slider" />
+    <jointvel name="cart_vel"  joint="slider" />
+    <jointpos name="pole_angle" joint="hinge" />
+    <jointvel name="pole_vel"   joint="hinge" />
+  </sensor>
+
+</mujoco>
